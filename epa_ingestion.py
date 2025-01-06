@@ -669,27 +669,27 @@ if __name__ == "__main__":
     # Initialize processor and create tables
     processor = EPADataProcessor(snowflake_params)
     
-    # epa_df = processor.get_focus_products()
-    # epa_list = epa_numbers['EPAREGNO'].tolist()
-    # processor.create_tables()
+    epa_df = processor.get_focus_products()
+    epa_list = epa_numbers['EPAREGNO'].tolist()
+    processor.create_tables()
 
-    # # Process and load data
-    # if len(epa_list) > 0:
-    #     processor.process_and_load_data(epa_numbers)
-    # else:
-    #     logging.info("No data to process")
+    # Process and load data
+    if len(epa_list) > 0:
+        processor.process_and_load_data(epa_numbers)
+    else:
+        logging.info("No data to process")
 
-    # # Download and store PDFs
-    # pdf_to_download_df = processor.pdf_to_download()
+    # Download and store PDFs
+    pdf_to_download_df = processor.pdf_to_download()
 
-    # # For development check
-    # pdf_to_download_df = pdf_to_download_df[0:1]
+    # For development check
+    pdf_to_download_df = pdf_to_download_df[0:1]
 
-    # if len(pdf_to_download_df) > 0:
-    #     logging.info("Downloading and storing PDFs...")
-    #     processor.download_and_store_pdfs(pdf_to_download_df, stage_path)
-    # else:
-    #     logging.info("No PDFs to download")
+    if len(pdf_to_download_df) > 0:
+        logging.info("Downloading and storing PDFs...")
+        processor.download_and_store_pdfs(pdf_to_download_df, stage_path)
+    else:
+        logging.info("No PDFs to download")
 
     pdf_to_chunk_df = processor.pdf_to_chunk()
 
