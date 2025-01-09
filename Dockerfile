@@ -1,4 +1,4 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -22,4 +22,4 @@ COPY . .
 RUN echo "Container built for environment: $ENVIRONMENT"
 
 # Run script
-CMD ["python", "epa_processor.py"]
+CMD ["python", "epa_ingestion.py"]
