@@ -1,4 +1,4 @@
-ultname: EPA Data Pipeline CI/CD
+name: EPA Data Pipeline CI/CD
 
 on:
   push:
