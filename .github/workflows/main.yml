@@ -1,4 +1,4 @@
-name: EPA Data Pipeline CI/CD
+ultname: EPA Data Pipeline CI/CD
 
 on:
   push:
@@ -53,6 +53,6 @@ jobs:
       - name: Update ECS service
         run: |
           aws ecs update-service \
-            --cluster data-processing-cluster \
+            --cluster default \
             --service epa-processor-service \
             --force-new-deployment
