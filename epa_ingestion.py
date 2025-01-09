@@ -722,7 +722,7 @@ $$
 # Usage example
 if __name__ == "__main__":
     # Environment variable
-    env = os.getenv('ENV', 'DEV')
+    env = os.getenv('ENVIRONMENT', 'DEV')
 
     # Snowflake connection parameters
     snowflake_params = {

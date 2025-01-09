@@ -2,7 +2,9 @@ name: EPA Data Pipeline CI/CD
 
 on:
   push:
-    branches: [ master ]
+    branches: 
+      - main
+      - test
   workflow_dispatch:    # Allows manual trigger from GitHub UI
 
 env:
@@ -12,6 +14,8 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'PROD' || 'TEST' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -31,12 +35,20 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          echo "Building for environment: ${ENVIRONMENT}"
+          docker build \
+            --build-arg SNOWFLAKE_USER=${SNOWFLAKE_USER} \
+            --build-arg SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD} \
+            --build-arg SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           # Also tag as latest
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest-${ENVIRONMENT}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest-${ENVIRONMENT}
 
       - name: Update ECS service
         run: |
