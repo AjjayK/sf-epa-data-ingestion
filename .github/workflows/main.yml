@@ -55,4 +55,5 @@ jobs:
           aws ecs update-service \
             --cluster default \
             --service epa-processor-service \
-            --force-new-deployment
+            --force-new-deployment \
+            --task-definition epa-processor-task:3
