@@ -56,3 +56,4 @@ jobs:
             --cluster default \
             --service epa-processor-service \
             --force-new-deployment
+            --task-definition epa-processor-task:3
