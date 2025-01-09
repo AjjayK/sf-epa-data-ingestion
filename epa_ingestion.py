@@ -16,7 +16,8 @@ import ssl
 import tempfile
 import re
 from pathlib import Path
-
+from enum import Enum
+import sys
 class CustomAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         context = create_urllib3_context(cert_reqs=None)
@@ -25,10 +26,45 @@ class CustomAdapter(HTTPAdapter):
         context.verify_mode = ssl.CERT_NONE
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
+class Environment(Enum):
+    DEV = "DEV"
+    TEST = "TEST"
+    PROD = "PROD"
+
+class DatabaseConfig:
+    def __init__(self, env: Environment):
+        self.env = env
+        
+    @property
+    def database_prefix(self) -> str:
+        return {
+            Environment.DEV: "DEV",
+            Environment.TEST: "TEST",
+            Environment.PROD: "PROD"
+        }[self.env]
+    
+    def get_database(self, name: str) -> str:
+        return f"{self.database_prefix}_{name}"
+    
+    @property
+    def config(self) -> Dict:
+        return {
+            "SRC_INGEST_DB": self.get_database("SRC_INGEST"),
+            "DP_APP_DB": self.get_database("DP_APP"),
+            "PDF_STORE_PATH": f"@{self.get_database('SRC_INGEST')}.EPA_RAW.PDF_STORE/EPA_LABEL_PDF"
+        }
+
+
 
 class EPADataProcessor:
-    def __init__(self, snowflake_conn_params: Dict):
-        self.conn_params = snowflake_conn_params
+    def __init__(self, snowflake_conn_params: Dict, env: str = "DEV"):
+        self.env = Environment(env.upper())
+        self.db_config = DatabaseConfig(self.env)
+        self.conn_params = {
+            **snowflake_conn_params,
+            'database': self.db_config.config['SRC_INGEST_DB'],
+            'schema': 'EPA_RAW'
+        }
         self.base_url = "https://ordspub.epa.gov/ords/pesticides/cswu/ppls"
         # Set up session with custom adapter
         self.session = requests.Session()
@@ -53,8 +89,8 @@ class EPADataProcessor:
     
     def get_focus_products(self):
         conn = self.get_snowflake_connection()
-        query = """
-            SELECT * FROM DEV_DP_APP.MODELED.FOCUS_PRODUCTS
+        query = f"""
+            SELECT * FROM {self.db_config.config['DP_APP_DB']}.MODELED.FOCUS_PRODUCTS
         """
 
         try:
@@ -64,8 +100,8 @@ class EPADataProcessor:
         except Exception as e:
             print(f"Error fetching data from Snowflake: {str(e)}")
             raise
-
-        conn.close()
+        finally:
+            conn.close()
 
 
     def fetch_epa_data(self, epa_number: str) -> Dict:
@@ -214,7 +250,7 @@ class EPADataProcessor:
 
         # Chunk table
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS EPA_PDF_INGESTION_CHUNK (
+            CREATE TABLE IF NOT EXISTS EPA_PROCESSED.DOCS_CHUNKS_TABLE (
                     RELATIVE_PATH VARCHAR(16777216), 
                     SIZE NUMBER(38,0), 
                     FILE_URL VARCHAR(16777216),
@@ -223,11 +259,43 @@ class EPADataProcessor:
                     CATEGORY VARCHAR(16777216)
                     )
         """)
+
+        # chunk function
+
+        cur.execute("""
+create or replace function EPA_PROCESSED.text_chunker(pdf_text string)
+returns table (chunk varchar)
+language python
+runtime_version = '3.9'
+handler = 'text_chunker'
+packages = ('snowflake-snowpark-python', 'langchain')
+as
+$$
+from snowflake.snowpark.types import StringType, StructField, StructType
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import pandas as pd
+
+class text_chunker:
+
+    def process(self, pdf_text: str):
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size = 1512, #Adjust this as you see fit
+            chunk_overlap  = 256, #This let's text have some form of overlap. Useful for keeping chunks contextual
+            length_function = len
+        )
+    
+        chunks = text_splitter.split_text(pdf_text)
+        df = pd.DataFrame(chunks, columns=['chunks'])
+        
+        yield from df.itertuples(index=False, name=None)
+$$
+        """
+        )
         conn.close()
 
     def process_and_load_data(self, epa_numbers: List[str]):
-        # For development check
-        #epa_numbers = epa_numbers[:1]
+
 
         for epa_number in epa_numbers:
             try:
@@ -354,9 +422,9 @@ class EPADataProcessor:
     def pdf_to_download(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
-        query = """
+        query = f"""
             SELECT *
-            FROM DEV_SRC_INGEST.EPA_RAW.VW_PDF_TO_DOWNLOAD
+            FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD
         """
 
         try:
@@ -370,9 +438,9 @@ class EPADataProcessor:
     def pdf_to_chunk(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
-        query = """
+        query = f"""
             SELECT *
-            FROM DEV_SRC_INGEST.EPA_RAW.VW_PDF_TO_CHUNK
+            FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK
         """
 
         try:
@@ -600,37 +668,38 @@ class EPADataProcessor:
         """
         conn = self.get_snowflake_connection()
         cursor = conn.cursor()
+        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
         
         try:
-            delete_query = """
-            DELETE FROM DEV_SRC_INGEST.EPA_PROCESSED.DOCS_CHUNKS_TABLE AS T1
-            USING DEV_SRC_INGEST.EPA_RAW.VW_PDF_TO_CHUNK AS T2
+            delete_query = f"""
+            DELETE FROM {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE AS T1
+            USING {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK AS T2
             WHERE T1.RELATIVE_PATH = T2.RELATIVE_PATH
             """
             cursor.execute(delete_query)
             
-            insert_query = """
-            INSERT INTO DEV_SRC_INGEST.EPA_PROCESSED.DOCS_CHUNKS_TABLE (relative_path, size, file_url, scoped_file_url, chunk)
+            insert_query = f"""
+            INSERT INTO {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE (relative_path, size, file_url, scoped_file_url, chunk)
             WITH pdf_to_chunk AS (
                 SELECT 
                     new_docs.relative_path, 
                     new_docs.size, 
                     new_docs.file_url, 
-                    build_scoped_file_url(@DEV_SRC_INGEST.EPA_RAW.PDF_STORE, new_docs.relative_path) AS scoped_file_url
-                FROM DEV_SRC_INGEST.EPA_RAW.VW_PDF_TO_CHUNK as new_docs
+                    build_scoped_file_url(@{src_ingest_db}.EPA_RAW.PDF_STORE, new_docs.relative_path) AS scoped_file_url
+                FROM {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK as new_docs
             )
             SELECT *
             FROM pdf_to_chunk,
-            TABLE(DEV_SRC_INGEST.EPA_PROCESSED.TEXT_CHUNKER(TO_VARCHAR(SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@DEV_SRC_INGEST.EPA_RAW.PDF_STORE, 
-                                        relative_path, {'mode': 'LAYOUT'}))))
+            TABLE({src_ingest_db}.EPA_PROCESSED.TEXT_CHUNKER(TO_VARCHAR(SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@{src_ingest_db}.EPA_RAW.PDF_STORE, 
+                                        relative_path, {{'mode': 'LAYOUT'}}))))
             """
             cursor.execute(insert_query)
             
 
-            update_query = """
+            update_query = f"""
             UPDATE EPA_PDF_INGESTION_METADATA m
             SET PROCESSING_STATUS = 'CHUNKED'
-            FROM DEV_SRC_INGEST.EPA_RAW.VW_PDF_TO_CHUNK c
+            FROM {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK c
             WHERE m.STAGE_FILE_PATH LIKE '%' || c.RELATIVE_PATH
             """
             cursor.execute(update_query)
@@ -652,42 +721,44 @@ class EPADataProcessor:
     
 # Usage example
 if __name__ == "__main__":
+    # Environment variable
+    env = os.getenv('ENVIRONMENT', 'DEV')
+
     # Snowflake connection parameters
     snowflake_params = {
         'user': os.getenv('user'),
         'password': os.getenv('password'),
         'account': os.getenv('account'),
-        'warehouse': 'COMPUTE_WH',
-        'database': 'DEV_SRC_INGEST',
-        'schema': 'EPA_RAW'
+        'warehouse': 'COMPUTE_WH'
     }
 
-
-    # PDF store path and metadata table name
-    stage_path = '@DEV_SRC_INGEST.EPA_RAW.PDF_STORE/EPA_LABEL_PDF'
-
     # Initialize processor and create tables
-    processor = EPADataProcessor(snowflake_params)
+    processor = EPADataProcessor(snowflake_params, env)
     
     epa_df = processor.get_focus_products()
-    epa_list = epa_numbers['EPAREGNO'].tolist()
-    processor.create_tables()
+    # For development check
+    #epa_df = epa_df[:1]
+    epa_list = epa_df['EPAREGNO'].tolist()
+
+
 
     # Process and load data
     if len(epa_list) > 0:
-        processor.process_and_load_data(epa_numbers)
+        processor.create_tables()
+        processor.process_and_load_data(epa_list)
     else:
         logging.info("No data to process")
+        #sys.exit(0)
 
     # Download and store PDFs
     pdf_to_download_df = processor.pdf_to_download()
 
     # For development check
-    pdf_to_download_df = pdf_to_download_df[0:1]
+    #pdf_to_download_df = pdf_to_download_df[0:1]
 
     if len(pdf_to_download_df) > 0:
         logging.info("Downloading and storing PDFs...")
-        processor.download_and_store_pdfs(pdf_to_download_df, stage_path)
+        processor.download_and_store_pdfs(pdf_to_download_df, processor.db_config.config['PDF_STORE_PATH'])
     else:
         logging.info("No PDFs to download")
 
