@@ -765,6 +765,35 @@ $$
             cursor.close()
             conn.close()
 
+    def create_cortex_search_(self):
+        conn = self.get_snowflake_connection()
+        cursor = conn.cursor()
+        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+
+        try:
+            query = f"""
+            create or replace CORTEX SEARCH SERVICE CC_SEARCH_SERVICE_CS_{src_ingest_db}
+            ON chunk
+            ATTRIBUTES PRODUCTNAME, SIGNAL_WORD, CATEGORY_EPA_TYPE, COMPANYNAME
+            warehouse = COMPUTE_WH
+            TARGET_LAG = '1 minute'
+            as (
+                select *
+                from {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+            )
+            """
+            cursor.execute(query)
+            conn.commit()
+            logging.info("Successfully created search service")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error creating search service: {str(e)}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
 # Usage example
 if __name__ == "__main__":
     # Environment variable
@@ -780,41 +809,42 @@ if __name__ == "__main__":
 
     # Initialize processor and create tables
     processor = EPADataProcessor(snowflake_params, env)
-    processor.update_category()
-    # epa_df = processor.get_focus_products()
-    # # For development check
-    # #epa_df = epa_df[:1]
-    # epa_list = epa_df['EPAREGNO'].tolist()
+
+    epa_df = processor.get_focus_products()
+    # For development check
+    #epa_df = epa_df[:1]
+    epa_list = epa_df['EPAREGNO'].tolist()
 
 
 
-    # # Process and load data
-    # if len(epa_list) > 0:
-    #     processor.create_tables()
-    #     processor.process_and_load_data(epa_list)
-    # else:
-    #     logging.info("No data to process")
-    #     #sys.exit(0)
+    # Process and load data
+    if len(epa_list) > 0:
+        processor.create_tables()
+        processor.process_and_load_data(epa_list)
+    else:
+        logging.info("No data to process")
+        sys.exit(0)
 
-    # # Download and store PDFs
-    # pdf_to_download_df = processor.pdf_to_download()
+    # Download and store PDFs
+    pdf_to_download_df = processor.pdf_to_download()
 
-    # # For development check
-    # #pdf_to_download_df = pdf_to_download_df[0:1]
+    # For development check
+    #pdf_to_download_df = pdf_to_download_df[0:1]
 
-    # if len(pdf_to_download_df) > 0:
-    #     logging.info("Downloading and storing PDFs...")
-    #     processor.download_and_store_pdfs(pdf_to_download_df, processor.db_config.config['PDF_STORE_PATH'])
-    # else:
-    #     logging.info("No PDFs to download")
+    if len(pdf_to_download_df) > 0:
+        logging.info("Downloading and storing PDFs...")
+        processor.download_and_store_pdfs(pdf_to_download_df, processor.db_config.config['PDF_STORE_PATH'])
+    else:
+        logging.info("No PDFs to download")
 
-    # pdf_to_chunk_df = processor.pdf_to_chunk()
+    pdf_to_chunk_df = processor.pdf_to_chunk()
 
-    # if len(pdf_to_chunk_df) > 0:
-    #     logging.info("Chunking PDFs...")
-    #     processor.process_pdf_chunks()
-    #     processor.update_category()
+    if len(pdf_to_chunk_df) > 0:
+        logging.info("Chunking PDFs...")
+        processor.process_pdf_chunks()
+        processor.update_category()
+        processor.create_cortex_search_()
 
-    # else:
-    #     logging.info("No PDFs to chunk")
+    else:
+        logging.info("No PDFs to chunk")
 
