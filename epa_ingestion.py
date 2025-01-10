@@ -718,7 +718,53 @@ $$
             cursor.close()
             conn.close()
     
-    
+    def update_category(self):
+        conn = self.get_snowflake_connection()
+        cursor = conn.cursor()
+        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+        try:
+            
+            alter_table = f"""
+                ALTER TABLE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+                ADD COLUMN
+                    IF NOT EXISTS COMPANYNAME VARCHAR,
+                    IF NOT EXISTS PRODUCTNAME VARCHAR,
+                    IF NOT EXISTS SIGNAL_WORD VARCHAR,
+                    IF NOT EXISTS CATEGORY_EPA_TYPE ARRAY
+            """
+            cursor.execute(alter_table)
+
+            update_query = f"""
+            UPDATE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE A
+                SET 
+                A.COMPANYNAME = C.NAME,
+                A.PRODUCTNAME = B.PRODUCT_NAME,
+                A.SIGNAL_WORD = D.SIGNAL_WORD,
+                A.CATEGORY_EPA_TYPE = TYPE_ARRAY
+                FROM {src_ingest_db}.EPA_RAW.EPA_PDF_INGESTION_METADATA B 
+                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_COMPANY_INFO AS C ON B.EPAREGNO =C.EPAREGNO
+                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_PRODUCTS AS D ON D.EPAREGNO = B.EPAREGNO
+                LEFT JOIN (
+                    SELECT 
+                        EPAREGNO,
+                        ARRAY_AGG(TYPE) AS TYPE_ARRAY
+                    FROM {src_ingest_db}.EPA_RAW.EPA_TYPES
+                    GROUP BY EPAREGNO
+                ) T ON T.EPAREGNO = B.EPAREGNO
+                WHERE A.RELATIVE_PATH = REGEXP_SUBSTR(B.stage_file_path, 'EPA_LABEL_PDF/.*$')
+            """
+            cursor.execute(update_query)
+            conn.commit()
+            logging.info("Successfully updated PDF category")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating PDF category: {str(e)}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
 # Usage example
 if __name__ == "__main__":
     # Environment variable
@@ -734,39 +780,41 @@ if __name__ == "__main__":
 
     # Initialize processor and create tables
     processor = EPADataProcessor(snowflake_params, env)
-    
-    epa_df = processor.get_focus_products()
-    # For development check
-    #epa_df = epa_df[:1]
-    epa_list = epa_df['EPAREGNO'].tolist()
+    processor.update_category()
+    # epa_df = processor.get_focus_products()
+    # # For development check
+    # #epa_df = epa_df[:1]
+    # epa_list = epa_df['EPAREGNO'].tolist()
 
 
 
-    # Process and load data
-    if len(epa_list) > 0:
-        processor.create_tables()
-        processor.process_and_load_data(epa_list)
-    else:
-        logging.info("No data to process")
-        #sys.exit(0)
+    # # Process and load data
+    # if len(epa_list) > 0:
+    #     processor.create_tables()
+    #     processor.process_and_load_data(epa_list)
+    # else:
+    #     logging.info("No data to process")
+    #     #sys.exit(0)
 
-    # Download and store PDFs
-    pdf_to_download_df = processor.pdf_to_download()
+    # # Download and store PDFs
+    # pdf_to_download_df = processor.pdf_to_download()
 
-    # For development check
-    #pdf_to_download_df = pdf_to_download_df[0:1]
+    # # For development check
+    # #pdf_to_download_df = pdf_to_download_df[0:1]
 
-    if len(pdf_to_download_df) > 0:
-        logging.info("Downloading and storing PDFs...")
-        processor.download_and_store_pdfs(pdf_to_download_df, processor.db_config.config['PDF_STORE_PATH'])
-    else:
-        logging.info("No PDFs to download")
+    # if len(pdf_to_download_df) > 0:
+    #     logging.info("Downloading and storing PDFs...")
+    #     processor.download_and_store_pdfs(pdf_to_download_df, processor.db_config.config['PDF_STORE_PATH'])
+    # else:
+    #     logging.info("No PDFs to download")
 
-    pdf_to_chunk_df = processor.pdf_to_chunk()
+    # pdf_to_chunk_df = processor.pdf_to_chunk()
 
-    if len(pdf_to_chunk_df) > 0:
-        logging.info("Chunking PDFs...")
-        processor.process_pdf_chunks()
-    else:
-        logging.info("No PDFs to chunk")
+    # if len(pdf_to_chunk_df) > 0:
+    #     logging.info("Chunking PDFs...")
+    #     processor.process_pdf_chunks()
+    #     processor.update_category()
+
+    # else:
+    #     logging.info("No PDFs to chunk")
 
