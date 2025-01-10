@@ -772,7 +772,7 @@ $$
 
         try:
             query = f"""
-            create or replace CORTEX SEARCH SERVICE CC_SEARCH_SERVICE_CS_{src_ingest_db}
+            create or replace CORTEX SEARCH SERVICE {src_ingest_db}.EPA_PROCESSED.CC_SEARCH_SERVICE_CS_{src_ingest_db}
             ON chunk
             ATTRIBUTES PRODUCTNAME, SIGNAL_WORD, CATEGORY_EPA_TYPE, COMPANYNAME
             warehouse = COMPUTE_WH
@@ -810,6 +810,7 @@ if __name__ == "__main__":
     # Initialize processor and create tables
     processor = EPADataProcessor(snowflake_params, env)
 
+    
     epa_df = processor.get_focus_products()
     # For development check
     #epa_df = epa_df[:1]
