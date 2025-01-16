@@ -889,12 +889,12 @@ if __name__ == "__main__":
 
 
     # Process and load data
-    if len(epa_list) > 99999:
+    if len(epa_list) > 0:
         processor.create_tables()
         processor.process_and_load_data(epa_list)
     else:
         logging.info("No data to process")
-        #sys.exit(0)
+        sys.exit(0)
 
     # Download and store PDFs
     pdf_to_download_df = processor.pdf_to_download()
