@@ -11,7 +11,7 @@ env:
   ECR_REPOSITORY: epa-data-processor
   ECS_SERVICE: epa-service
   ECS_CLUSTER: epa-cluster
-  ECS_TASK_DEFINITION: .aws\epa-task-revision1.json
+  ECS_TASK_DEFINITION: .aws/epa-task-revision1.json
   SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
   SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
   SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
