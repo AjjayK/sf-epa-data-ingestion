@@ -294,6 +294,12 @@ $$
         )
         conn.close()
 
+        # PDF STAGE
+        cur.execute(f"""
+        create or replace stage EPA_RAW.PDF_STORE DIRECTORY = (
+        ENABLE = TRUE)
+        """)
+
     def process_and_load_data(self, epa_numbers: List[str]):
 
 
@@ -422,6 +428,42 @@ $$
     def pdf_to_download(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+
+        create_view = f"""
+            create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD(
+            EPAREGNO,
+            PRODUCTNAME,
+            REGISTEREDDATE,
+            CANCEL_FLAG,
+            CANCELLATIONREASON,
+            PRODUCT_STATUS,
+            PRODUCT_STATUS_DATE,
+            SIGNAL_WORD,
+            RUP_YN,
+            TRANSFER_FLAG,
+            PDFFILE,
+            PDFFILE_ACCEPTED_DATE
+        ) as 
+        with updated as (
+        select prd.*, PDF.PDFFILE, PDF.PDFFILE_ACCEPTED_DATE
+        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PRODUCTS as prd
+        join {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_FILES as pdf on prd.eparegno = pdf.eparegno
+        qualify row_number() over (partition by PRD.eparegno order by pdffile_accepted_date desc) = 1
+        )
+        select UPDATED.*
+        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA  AS M
+        RIGHT JOIN UPDATED ON UPDATED.PDFFILE = M.PDFFILE
+        WHERE M.PDFFILE IS NULL
+        """
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(create_view)
+            cursor.close()
+        except Exception as e:
+            print(f"Error creating view pdf_to_download: {str(e)}")
+            raise
+
         query = f"""
             SELECT *
             FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD
@@ -438,6 +480,34 @@ $$
     def pdf_to_chunk(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+
+        create_view = f"""
+        create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK(
+            RELATIVE_PATH,
+            SIZE,
+            LAST_MODIFIED,
+            MD5,
+            ETAG,
+            FILE_URL
+        ) as 
+        select store.*
+        from directory(@{self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.PDF_STORE) as store
+        inner join (
+            select *, REGEXP_SUBSTR(stage_file_path, 'EPA_LABEL_PDF/.*$') as META_relative_path
+            from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA 
+            where processing_status = 'PENDING'
+            ) as meta 
+            on meta.META_relative_path = store.relative_path
+        """
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(create_view)
+            cursor.close()
+        except Exception as e:
+            print(f"Error creating view pdf_to_chunk: {str(e)}")
+            raise
+
         query = f"""
             SELECT *
             FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK
@@ -819,12 +889,12 @@ if __name__ == "__main__":
 
 
     # Process and load data
-    if len(epa_list) > 0:
+    if len(epa_list) > 99999:
         processor.create_tables()
         processor.process_and_load_data(epa_list)
     else:
         logging.info("No data to process")
-        sys.exit(0)
+        #sys.exit(0)
 
     # Download and store PDFs
     pdf_to_download_df = processor.pdf_to_download()
