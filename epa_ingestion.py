@@ -294,6 +294,12 @@ $$
         )
         conn.close()
 
+        # PDF STAGE
+        cur.execute(f"""
+        create or replace stage EPA_RAW.PDF_STORE DIRECTORY = (
+        ENABLE = TRUE)
+        """)
+
     def process_and_load_data(self, epa_numbers: List[str]):
 
 
@@ -422,6 +428,42 @@ $$
     def pdf_to_download(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+
+        create_view = f"""
+            create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD(
+            EPAREGNO,
+            PRODUCTNAME,
+            REGISTEREDDATE,
+            CANCEL_FLAG,
+            CANCELLATIONREASON,
+            PRODUCT_STATUS,
+            PRODUCT_STATUS_DATE,
+            SIGNAL_WORD,
+            RUP_YN,
+            TRANSFER_FLAG,
+            PDFFILE,
+            PDFFILE_ACCEPTED_DATE
+        ) as 
+        with updated as (
+        select prd.*, PDF.PDFFILE, PDF.PDFFILE_ACCEPTED_DATE
+        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PRODUCTS as prd
+        join {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_FILES as pdf on prd.eparegno = pdf.eparegno
+        qualify row_number() over (partition by PRD.eparegno order by pdffile_accepted_date desc) = 1
+        )
+        select UPDATED.*
+        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA  AS M
+        RIGHT JOIN UPDATED ON UPDATED.PDFFILE = M.PDFFILE
+        WHERE M.PDFFILE IS NULL
+        """
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(create_view)
+            cursor.close()
+        except Exception as e:
+            print(f"Error creating view pdf_to_download: {str(e)}")
+            raise
+
         query = f"""
             SELECT *
             FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD
@@ -438,6 +480,34 @@ $$
     def pdf_to_chunk(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+
+        create_view = f"""
+        create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK(
+            RELATIVE_PATH,
+            SIZE,
+            LAST_MODIFIED,
+            MD5,
+            ETAG,
+            FILE_URL
+        ) as 
+        select store.*
+        from directory(@{self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.PDF_STORE) as store
+        inner join (
+            select *, REGEXP_SUBSTR(stage_file_path, 'EPA_LABEL_PDF/.*$') as META_relative_path
+            from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA 
+            where processing_status = 'PENDING'
+            ) as meta 
+            on meta.META_relative_path = store.relative_path
+        """
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(create_view)
+            cursor.close()
+        except Exception as e:
+            print(f"Error creating view pdf_to_chunk: {str(e)}")
+            raise
+
         query = f"""
             SELECT *
             FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK
@@ -718,7 +788,82 @@ $$
             cursor.close()
             conn.close()
     
-    
+    def update_category(self):
+        conn = self.get_snowflake_connection()
+        cursor = conn.cursor()
+        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+        try:
+            
+            alter_table = f"""
+                ALTER TABLE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+                ADD COLUMN
+                    IF NOT EXISTS COMPANYNAME VARCHAR,
+                    IF NOT EXISTS PRODUCTNAME VARCHAR,
+                    IF NOT EXISTS SIGNAL_WORD VARCHAR,
+                    IF NOT EXISTS CATEGORY_EPA_TYPE ARRAY
+            """
+            cursor.execute(alter_table)
+
+            update_query = f"""
+            UPDATE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE A
+                SET 
+                A.COMPANYNAME = C.NAME,
+                A.PRODUCTNAME = B.PRODUCT_NAME,
+                A.SIGNAL_WORD = D.SIGNAL_WORD,
+                A.CATEGORY_EPA_TYPE = TYPE_ARRAY
+                FROM {src_ingest_db}.EPA_RAW.EPA_PDF_INGESTION_METADATA B 
+                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_COMPANY_INFO AS C ON B.EPAREGNO =C.EPAREGNO
+                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_PRODUCTS AS D ON D.EPAREGNO = B.EPAREGNO
+                LEFT JOIN (
+                    SELECT 
+                        EPAREGNO,
+                        ARRAY_AGG(TYPE) AS TYPE_ARRAY
+                    FROM {src_ingest_db}.EPA_RAW.EPA_TYPES
+                    GROUP BY EPAREGNO
+                ) T ON T.EPAREGNO = B.EPAREGNO
+                WHERE A.RELATIVE_PATH = REGEXP_SUBSTR(B.stage_file_path, 'EPA_LABEL_PDF/.*$')
+            """
+            cursor.execute(update_query)
+            conn.commit()
+            logging.info("Successfully updated PDF category")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating PDF category: {str(e)}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def create_cortex_search_(self):
+        conn = self.get_snowflake_connection()
+        cursor = conn.cursor()
+        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+
+        try:
+            query = f"""
+            create or replace CORTEX SEARCH SERVICE {src_ingest_db}.EPA_PROCESSED.CC_SEARCH_SERVICE_CS_{src_ingest_db}
+            ON chunk
+            ATTRIBUTES PRODUCTNAME, SIGNAL_WORD, CATEGORY_EPA_TYPE, COMPANYNAME
+            warehouse = COMPUTE_WH
+            TARGET_LAG = '1 minute'
+            as (
+                select *
+                from {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+            )
+            """
+            cursor.execute(query)
+            conn.commit()
+            logging.info("Successfully created search service")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error creating search service: {str(e)}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
 # Usage example
 if __name__ == "__main__":
     # Environment variable
@@ -734,6 +879,7 @@ if __name__ == "__main__":
 
     # Initialize processor and create tables
     processor = EPADataProcessor(snowflake_params, env)
+
     
     epa_df = processor.get_focus_products()
     # For development check
@@ -748,7 +894,7 @@ if __name__ == "__main__":
         processor.process_and_load_data(epa_list)
     else:
         logging.info("No data to process")
-        #sys.exit(0)
+        sys.exit(0)
 
     # Download and store PDFs
     pdf_to_download_df = processor.pdf_to_download()
@@ -767,6 +913,9 @@ if __name__ == "__main__":
     if len(pdf_to_chunk_df) > 0:
         logging.info("Chunking PDFs...")
         processor.process_pdf_chunks()
+        processor.update_category()
+        processor.create_cortex_search_()
+
     else:
         logging.info("No PDFs to chunk")
 
