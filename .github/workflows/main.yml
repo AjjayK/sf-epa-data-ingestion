@@ -1,58 +1,76 @@
 name: EPA Data Pipeline CI/CD
 
 on:
-  pull_request:
-    branches: 
+  push:
+    branches:
       - main
       - test
+  workflow_dispatch:
 
-env:
-  AWS_REGION: us-east-2  # Change this to your AWS region
-  ECR_REPOSITORY: epa-data-processor
-  ECS_SERVICE: epa-service
-  ECS_CLUSTER: epa-cluster
-  ECS_TASK_DEFINITION: .aws/epa-task-revision1.json
-  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-  CONTAINER_NAME: epa-test
+permissions:
+  id-token: write   # required to mint the OIDC token for AWS
+  contents: read
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'PROD' || 'TEST' }}
     env:
       ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'PROD' || 'TEST' }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      TASK_ROLE_ARN: ${{ vars.TASK_ROLE_ARN }}
+      EXECUTION_ROLE_ARN: ${{ vars.EXECUTION_ROLE_ARN }}
+      LOG_GROUP: ${{ vars.LOG_GROUP }}
+      SECRETS_ARN: ${{ vars.SECRETS_ARN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
-
         run: |
-          echo "Building for environment: ${ENVIRONMENT}"
-          docker build \
-            --build-arg SNOWFLAKE_USER=${SNOWFLAKE_USER} \
-            --build-arg SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD} \
-            --build-arg SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT} \
-            --build-arg ENVIRONMENT=${ENVIRONMENT} \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          # Also tag as latest
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest-${ENVIRONMENT}
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest-${ENVIRONMENT}
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          LATEST_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest-${ENVIRONMENT}"
+          docker build --build-arg ENVIRONMENT="${ENVIRONMENT}" -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          docker tag "$IMAGE_URI" "$LATEST_URI"
+          docker push "$LATEST_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
+      - name: Render ECS task definition
+        id: render
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
+        run: |
+          set -euo pipefail
+          envsubst < .aws/epa-task.template.json > rendered-task.json
+          echo "Rendered task definition:"
+          cat rendered-task.json
+
+      - name: Register ECS task definition
+        id: register
+        run: |
+          set -euo pipefail
+          REVISION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://rendered-task.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "Registered: $REVISION_ARN"
+          echo "revision_arn=$REVISION_ARN" >> "$GITHUB_OUTPUT"

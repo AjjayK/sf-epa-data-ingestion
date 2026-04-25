@@ -1,0 +1,39 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Local Python environment
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local config
+.env
+*.env
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project artefacts not needed at runtime
+.github/
+.aws/
+terraform/
+docs/
+epa_pdfs/
+*.ipynb
+EPA_LIST.csv
+pdf_ingestion.py
+README.md
+CLAUDE.md

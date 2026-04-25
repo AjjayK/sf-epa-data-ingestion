@@ -1,0 +1,41 @@
+snowflake:
+  warehouse: COMPUTE_WH
+
+databases:
+  src_ingest_suffix: SRC_INGEST   # prefixed by env → DEV_SRC_INGEST
+  dp_app_suffix:     DP_APP       # prefixed by env → DEV_DP_APP
+
+schemas:
+  raw:       EPA_RAW
+  processed: EPA_PROCESSED
+  modeled:   MODELED
+
+stage:
+  name:      PDF_STORE
+  subfolder: EPA_LABEL_PDF        # used in REGEXP_SUBSTR patterns and PUT paths
+
+tables:
+  products:            EPA_PRODUCTS
+  company_info:        EPA_COMPANY_INFO
+  active_ingredients:  EPA_ACTIVE_INGREDIENTS
+  sites:               EPA_SITES
+  pests:               EPA_PESTS
+  types:               EPA_TYPES
+  transfer_history:    EPA_TRANSFER_HISTORY
+  pdf_files:           EPA_PDF_FILES
+  alt_brand_names:     EPA_ALT_BRAND_NAMES
+  formulations:        EPA_FORMULATIONS
+  pdf_ingestion_meta:  EPA_PDF_INGESTION_METADATA
+  temp_pdf_meta:       TEMP_EPA_PDF_INGESTION_METADATA
+  docs_chunks:         DOCS_CHUNKS_TABLE
+  focus_products:      FOCUS_PRODUCTS
+
+views:
+  pdf_to_download: VW_PDF_TO_DOWNLOAD
+  pdf_to_chunk:    VW_PDF_TO_CHUNK
+
+udfs:
+  text_chunker: text_chunker
+
+cortex_search:
+  service_prefix: CC_SEARCH_SERVICE_CS
