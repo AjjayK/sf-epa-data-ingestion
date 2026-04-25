@@ -85,9 +85,13 @@ The task runs on **Fargate**. **EventBridge Scheduler** triggers it daily (defau
 
 **Snowflake credentials** come from **AWS Secrets Manager** via the task definition's `secrets` block. They are injected as env vars `user`, `password`, `account` (lowercase, matching `epa_ingestion.py:947-949`). They are NOT passed as Docker build args.
 
-**Infrastructure** (ECR, Fargate cluster, IAM roles, secret, log group, EventBridge schedule, security group) is provisioned by Terraform under `terraform/`. To deploy in a new AWS account: `cd terraform && terraform apply`, then copy outputs into GitHub Variables/Secrets.
+**Infrastructure** (ECR, Fargate cluster, IAM roles, secret, log group, EventBridge schedule, security group, GitHub OIDC provider + CI role) is provisioned by Terraform under `terraform/`. To deploy in a new AWS account: `cd terraform && terraform apply`, then copy outputs into GitHub Variables.
 
-Required GitHub Variables (per environment): `AWS_REGION`, `AWS_ACCOUNT_ID`, `ECR_REPOSITORY`, `ECS_CLUSTER`, `TASK_ROLE_ARN`, `EXECUTION_ROLE_ARN`, `LOG_GROUP`, `SECRETS_ARN`. Required Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+**AWS auth from CI uses GitHub OIDC**, not static access keys. The workflow assumes `vars.AWS_ROLE_ARN` (output `github_actions_role_arn` from Terraform). The trust policy is scoped to `repo:<owner>/<repo>:environment:<PROD|TEST>`, so the role can only be assumed by this repo's workflow running in the matching GitHub Environment.
+
+When applying Terraform to a second environment in the same AWS account, set `create_github_oidc_provider = false` in that env's tfvars — the OIDC provider is account-wide and only needs to be created once.
+
+Required GitHub Variables (per environment): `AWS_REGION`, `AWS_ACCOUNT_ID`, `AWS_ROLE_ARN`, `ECR_REPOSITORY`, `ECS_CLUSTER`, `TASK_ROLE_ARN`, `EXECUTION_ROLE_ARN`, `LOG_GROUP`, `SECRETS_ARN`. No long-lived AWS access keys are needed.
 
 ## Key Implementation Details
 

@@ -47,3 +47,8 @@ output "schedule_name" {
   description = "EventBridge Scheduler name (for reference)."
   value       = aws_scheduler_schedule.epa_daily.name
 }
+
+output "github_actions_role_arn" {
+  description = "IAM role ARN that GitHub Actions assumes via OIDC — set as GitHub Variable AWS_ROLE_ARN for this environment."
+  value       = aws_iam_role.github_actions.arn
+}

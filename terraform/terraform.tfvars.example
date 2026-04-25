@@ -5,6 +5,13 @@ snowflake_user     = "REPLACE_ME"
 snowflake_password = "REPLACE_ME"
 snowflake_account  = "REPLACE_ME"
 
+# GitHub repo allowed to assume the CI role via OIDC.
+github_repository = "AjjayK/snowflake-mistral-rag-app"
+
+# Set to true for the first environment applied in an AWS account.
+# Set to false for the second/third env so Terraform reuses the existing provider.
+create_github_oidc_provider = true
+
 # Optional overrides
 # ecr_repository_name = "epa-data-processor"
 # ecs_cluster_name    = "epa-cluster"

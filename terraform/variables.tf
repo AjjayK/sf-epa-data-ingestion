@@ -53,3 +53,14 @@ variable "log_retention_days" {
   description = "CloudWatch log retention in days."
   default     = 30
 }
+
+variable "github_repository" {
+  type        = string
+  description = "GitHub repository allowed to assume the CI role via OIDC, in 'owner/repo' form (e.g. 'AjjayK/snowflake-mistral-rag-app')."
+}
+
+variable "create_github_oidc_provider" {
+  type        = bool
+  description = "Whether to create the account-wide GitHub OIDC provider. Set true for the first environment applied in an AWS account; set false for subsequent environments so Terraform reuses the existing provider."
+  default     = true
+}
