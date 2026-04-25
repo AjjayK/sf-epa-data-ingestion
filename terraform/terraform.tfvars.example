@@ -1,0 +1,12 @@
+aws_region  = "us-east-2"
+environment = "PROD"
+
+snowflake_user     = "REPLACE_ME"
+snowflake_password = "REPLACE_ME"
+snowflake_account  = "REPLACE_ME"
+
+# Optional overrides
+# ecr_repository_name = "epa-data-processor"
+# ecs_cluster_name    = "epa-cluster"
+# schedule_expression = "cron(0 6 * * ? *)"  # daily at 06:00 UTC
+# log_retention_days  = 30

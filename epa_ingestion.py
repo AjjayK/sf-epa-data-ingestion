@@ -6,6 +6,7 @@ import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 import json
 from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import os
 import logging
@@ -17,6 +18,7 @@ import tempfile
 import re
 from pathlib import Path
 from enum import Enum
+import yaml
 import sys
 class CustomAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -32,38 +34,83 @@ class Environment(Enum):
     PROD = "PROD"
 
 class DatabaseConfig:
-    def __init__(self, env: Environment):
+    def __init__(self, env: Environment, yaml_cfg: Dict = None):
         self.env = env
-        
+        self._yaml = yaml_cfg or {}
+
+    def _get(self, *keys, default=None):
+        node = self._yaml
+        for k in keys:
+            if not isinstance(node, dict) or k not in node:
+                return default
+            node = node[k]
+        return node
+
     @property
     def database_prefix(self) -> str:
-        return {
-            Environment.DEV: "DEV",
-            Environment.TEST: "TEST",
-            Environment.PROD: "PROD"
-        }[self.env]
-    
+        return self.env.value
+
     def get_database(self, name: str) -> str:
         return f"{self.database_prefix}_{name}"
-    
+
     @property
     def config(self) -> Dict:
+        src_db      = self.get_database(self._get('databases', 'src_ingest_suffix', default='SRC_INGEST'))
+        dp_db       = self.get_database(self._get('databases', 'dp_app_suffix',     default='DP_APP'))
+        raw_schema  = self._get('schemas', 'raw',       default='EPA_RAW')
+        proc_schema = self._get('schemas', 'processed', default='EPA_PROCESSED')
+        mod_schema  = self._get('schemas', 'modeled',   default='MODELED')
+        stage_name   = self._get('stage', 'name',      default='PDF_STORE')
+        stage_folder = self._get('stage', 'subfolder', default='EPA_LABEL_PDF')
         return {
-            "SRC_INGEST_DB": self.get_database("SRC_INGEST"),
-            "DP_APP_DB": self.get_database("DP_APP"),
-            "PDF_STORE_PATH": f"@{self.get_database('SRC_INGEST')}.EPA_RAW.PDF_STORE/EPA_LABEL_PDF"
+            # existing keys (names unchanged for backward compatibility)
+            'SRC_INGEST_DB':  src_db,
+            'DP_APP_DB':      dp_db,
+            'PDF_STORE_PATH': f"@{src_db}.{raw_schema}.{stage_name}/{stage_folder}",
+            # schemas
+            'RAW_SCHEMA':  raw_schema,
+            'PROC_SCHEMA': proc_schema,
+            'MOD_SCHEMA':  mod_schema,
+            # warehouse
+            'WAREHOUSE': self._get('snowflake', 'warehouse', default='COMPUTE_WH'),
+            # stage
+            'STAGE_NAME':   stage_name,
+            'STAGE_FOLDER': stage_folder,
+            # raw schema tables
+            'TBL_PRODUCTS':      self._get('tables', 'products',            default='EPA_PRODUCTS'),
+            'TBL_COMPANY_INFO':  self._get('tables', 'company_info',        default='EPA_COMPANY_INFO'),
+            'TBL_ACTIVE_ING':    self._get('tables', 'active_ingredients',  default='EPA_ACTIVE_INGREDIENTS'),
+            'TBL_SITES':         self._get('tables', 'sites',               default='EPA_SITES'),
+            'TBL_PESTS':         self._get('tables', 'pests',               default='EPA_PESTS'),
+            'TBL_TYPES':         self._get('tables', 'types',               default='EPA_TYPES'),
+            'TBL_TRANSFER_HIST': self._get('tables', 'transfer_history',    default='EPA_TRANSFER_HISTORY'),
+            'TBL_PDF_FILES':     self._get('tables', 'pdf_files',           default='EPA_PDF_FILES'),
+            'TBL_ALT_BRANDS':    self._get('tables', 'alt_brand_names',     default='EPA_ALT_BRAND_NAMES'),
+            'TBL_FORMULATIONS':  self._get('tables', 'formulations',        default='EPA_FORMULATIONS'),
+            'TBL_PDF_META':      self._get('tables', 'pdf_ingestion_meta',  default='EPA_PDF_INGESTION_METADATA'),
+            'TBL_TEMP_PDF_META': self._get('tables', 'temp_pdf_meta',       default='TEMP_EPA_PDF_INGESTION_METADATA'),
+            # processed schema tables
+            'TBL_DOCS_CHUNKS':    self._get('tables', 'docs_chunks',    default='DOCS_CHUNKS_TABLE'),
+            'TBL_FOCUS_PRODUCTS': self._get('tables', 'focus_products', default='FOCUS_PRODUCTS'),
+            # views
+            'VW_PDF_DOWNLOAD': self._get('views', 'pdf_to_download', default='VW_PDF_TO_DOWNLOAD'),
+            'VW_PDF_CHUNK':    self._get('views', 'pdf_to_chunk',    default='VW_PDF_TO_CHUNK'),
+            # UDFs
+            'UDF_TEXT_CHUNKER': self._get('udfs', 'text_chunker', default='text_chunker'),
+            # Cortex search
+            'CORTEX_SVC_PREFIX': self._get('cortex_search', 'service_prefix', default='CC_SEARCH_SERVICE_CS'),
         }
 
 
 
 class EPADataProcessor:
-    def __init__(self, snowflake_conn_params: Dict, env: str = "DEV"):
+    def __init__(self, snowflake_conn_params: Dict, env: str = "DEV", yaml_cfg: Dict = None):
         self.env = Environment(env.upper())
-        self.db_config = DatabaseConfig(self.env)
+        self.db_config = DatabaseConfig(self.env, yaml_cfg)
         self.conn_params = {
             **snowflake_conn_params,
             'database': self.db_config.config['SRC_INGEST_DB'],
-            'schema': 'EPA_RAW'
+            'schema': self.db_config.config['RAW_SCHEMA']
         }
         self.base_url = "https://ordspub.epa.gov/ords/pesticides/cswu/ppls"
         # Set up session with custom adapter
@@ -89,16 +136,17 @@ class EPADataProcessor:
     
     def get_focus_products(self):
         conn = self.get_snowflake_connection()
+        cfg = self.db_config.config
         query = f"""
-            SELECT * FROM {self.db_config.config['DP_APP_DB']}.MODELED.FOCUS_PRODUCTS
+            SELECT * FROM {cfg['DP_APP_DB']}.{cfg['MOD_SCHEMA']}.{cfg['TBL_FOCUS_PRODUCTS']}
         """
 
         try:
             df = pd.read_sql(query, conn)
-            print(f"Retrieved {len(df)} focus products")
+            logging.info(f"Retrieved {len(df)} focus products")
             return df
         except Exception as e:
-            print(f"Error fetching data from Snowflake: {str(e)}")
+            logging.error(f"Error fetching data from Snowflake: {str(e)}")
             raise
         finally:
             conn.close()
@@ -118,10 +166,11 @@ class EPADataProcessor:
     def create_tables(self):
         conn = self.get_snowflake_connection()
         cur = conn.cursor()
+        cfg = self.db_config.config
 
         # Main product table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_PRODUCTS (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_PRODUCTS']} (
             eparegno STRING PRIMARY KEY,
             productname STRING,
             registereddate STRING,
@@ -136,8 +185,8 @@ class EPADataProcessor:
         """)
 
         # Company info table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_COMPANY_INFO (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_COMPANY_INFO']} (
             eparegno STRING,
             name STRING,
             contact_person STRING,
@@ -150,90 +199,90 @@ class EPADataProcessor:
             city STRING,
             state STRING,
             zip_code STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
         # Similar CREATE TABLE statements for other nested structures
         # Active ingredients table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_ACTIVE_INGREDIENTS (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_ACTIVE_ING']} (
             eparegno STRING,
             pc_code STRING,
             active_ing STRING,
             cas_number STRING,
             active_ing_percent FLOAT,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
         # Sites table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_SITES (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_SITES']} (
             eparegno STRING,
             site STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
         # Pests table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_PESTS (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_PESTS']} (
             eparegno STRING,
             pest STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
 
         # Types table
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_TYPES (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_TYPES']} (
             eparegno STRING,
             type STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_TRANSFER_HISTORY (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_TRANSFER_HIST']} (
             eparegno STRING,
             previous_eparegno STRING,
             previous_company STRING,
             transferred_date STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_PDF_FILES (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_PDF_FILES']} (
             eparegno STRING,
             epa_reg_num STRING,
             pdffile STRING,
             pdffile_accepted_date STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_ALT_BRAND_NAMES (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_ALT_BRANDS']} (
             eparegno STRING,
             altbrandname STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
-        cur.execute("""
-        CREATE OR REPLACE TABLE EPA_FORMULATIONS (
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE {cfg['TBL_FORMULATIONS']} (
             eparegno STRING,
             formulation STRING,
-            FOREIGN KEY (eparegno) REFERENCES EPA_PRODUCTS(eparegno)
+            FOREIGN KEY (eparegno) REFERENCES {cfg['TBL_PRODUCTS']}(eparegno)
         )
         """)
 
         # Metadata table
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS EPA_PDF_INGESTION_METADATA (
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {cfg['TBL_PDF_META']} (
             id INTEGER AUTOINCREMENT,
             product_name VARCHAR,
             stage_file_path VARCHAR,
@@ -249,21 +298,21 @@ class EPADataProcessor:
         """)
 
         # Chunk table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS EPA_PROCESSED.DOCS_CHUNKS_TABLE (
-                    RELATIVE_PATH VARCHAR(16777216), 
-                    SIZE NUMBER(38,0), 
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']} (
+                    RELATIVE_PATH VARCHAR(16777216),
+                    SIZE NUMBER(38,0),
                     FILE_URL VARCHAR(16777216),
-                    SCOPED_FILE_URL VARCHAR(16777216), 
-                    CHUNK VARCHAR(16777216), 
+                    SCOPED_FILE_URL VARCHAR(16777216),
+                    CHUNK VARCHAR(16777216),
                     CATEGORY VARCHAR(16777216)
                     )
         """)
 
         # chunk function
 
-        cur.execute("""
-create or replace function EPA_PROCESSED.text_chunker(pdf_text string)
+        cur.execute(f"""
+create or replace function {cfg['PROC_SCHEMA']}.{cfg['UDF_TEXT_CHUNKER']}(pdf_text string)
 returns table (chunk varchar)
 language python
 runtime_version = '3.9'
@@ -278,159 +327,143 @@ import pandas as pd
 class text_chunker:
 
     def process(self, pdf_text: str):
-        
+
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size = 1512, #Adjust this as you see fit
             chunk_overlap  = 256, #This let's text have some form of overlap. Useful for keeping chunks contextual
             length_function = len
         )
-    
+
         chunks = text_splitter.split_text(pdf_text)
         df = pd.DataFrame(chunks, columns=['chunks'])
-        
+
         yield from df.itertuples(index=False, name=None)
 $$
         """
         )
-        conn.close()
 
         # PDF STAGE
         cur.execute(f"""
-        create or replace stage EPA_RAW.PDF_STORE DIRECTORY = (
+        create or replace stage {cfg['RAW_SCHEMA']}.{cfg['STAGE_NAME']} DIRECTORY = (
         ENABLE = TRUE)
         """)
+        cur.close()
+        conn.close()
+
+    def _fetch_and_transform_product(self, epa_number: str) -> Dict:
+        """Fetch and transform one product into a dict of DataFrames. Called in parallel."""
+        logging.info(f"Processing EPA number: {epa_number}")
+        data = self.fetch_epa_data(epa_number)
+        cfg = self.db_config.config
+
+        product_df = pd.DataFrame([{
+            'eparegno': data['eparegno'],
+            'productname': data['productname'],
+            'registereddate': data['registereddate'],
+            'cancel_flag': data['cancel_flag'],
+            'cancellationreason': data['cancellationreason'],
+            'product_status': data['product_status'],
+            'product_status_date': data['product_status_date'],
+            'signal_word': data['signal_word'],
+            'rup_yn': data['rup_yn'],
+            'transfer_flag': data['transfer_flag']
+        }])
+        product_df.columns = product_df.columns.str.upper()
+
+        result = {cfg['TBL_PRODUCTS']: product_df}
+
+        if data.get('companyinfo'):
+            df = pd.DataFrame(data['companyinfo'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_COMPANY_INFO']] = df.rename(columns=str.upper)
+
+        if data.get('active_ingredients'):
+            df = pd.DataFrame(data['active_ingredients'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_ACTIVE_ING']] = df.rename(columns=str.upper)
+
+        if data.get('sites'):
+            df = pd.DataFrame(data['sites'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_SITES']] = df.rename(columns=str.upper)
+
+        if data.get('pests'):
+            df = pd.DataFrame(data['pests'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_PESTS']] = df.rename(columns=str.upper)
+
+        if data.get('formulations'):
+            df = pd.DataFrame(data['formulations'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_FORMULATIONS']] = df.rename(columns=str.upper)
+
+        if data.get('altbrandnames'):
+            df = pd.DataFrame(data['altbrandnames'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_ALT_BRANDS']] = df.rename(columns=str.upper)
+
+        if data.get('pdffiles'):
+            df = pd.DataFrame(data['pdffiles'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_PDF_FILES']] = df.rename(columns=str.upper)
+
+        if data.get('types'):
+            df = pd.DataFrame(data['types'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_TYPES']] = df.rename(columns=str.upper)
+
+        if data.get('transfer_history'):
+            df = pd.DataFrame(data['transfer_history'])
+            df['eparegno'] = data['eparegno']
+            result[cfg['TBL_TRANSFER_HIST']] = df.rename(columns=str.upper)
+
+        time.sleep(1)
+        return result
 
     def process_and_load_data(self, epa_numbers: List[str]):
+        succeeded = []
+        failed = []
+        accumulated: Dict[str, List] = {}
 
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(self._fetch_and_transform_product, n): n for n in epa_numbers}
+            for future in as_completed(futures):
+                epa_number = futures[future]
+                try:
+                    dfs = future.result()
+                    for table, df in dfs.items():
+                        accumulated.setdefault(table, []).append(df)
+                    succeeded.append(epa_number)
+                    logging.info(f"Successfully processed EPA number: {epa_number}")
+                except Exception as e:
+                    logging.error(f"Error processing EPA number {epa_number}: {str(e)}")
+                    failed.append({'eparegno': epa_number, 'error': str(e)})
 
-        for epa_number in epa_numbers:
+        # Single connection, one write_pandas per table
+        if accumulated:
+            conn = self.get_snowflake_connection()
             try:
-                # Fetch data from API
-                logging.info(f"Processing EPA number: {epa_number}")
-                data = self.fetch_epa_data(epa_number)
-                
-                # Process main product data
-                product_df = pd.DataFrame([{
-                    'eparegno': data['eparegno'],
-                    'productname': data['productname'],
-                    'registereddate': data['registereddate'],
-                    'cancel_flag': data['cancel_flag'],
-                    'cancellationreason': data['cancellationreason'],
-                    'product_status': data['product_status'],
-                    'product_status_date': data['product_status_date'],
-                    'signal_word': data['signal_word'],
-                    'rup_yn': data['rup_yn'],
-                    'transfer_flag': data['transfer_flag']
-                }])
-                product_df.columns = product_df.columns.str.upper()
-
-                # Initialize all DataFrames as None
-                company_df = None
-                active_ing_df = None
-                sites_df = None
-                pests_df = None
-                formulations_df = None
-                altbrands_df = None
-                pdf_df = None
-                types_df = None
-                transfer_df = None
-
-                # Process company info if exists
-                if data.get('companyinfo'):
-                    company_df = pd.DataFrame(data['companyinfo'])
-                    company_df['eparegno'] = data['eparegno']
-                    company_df.columns = company_df.columns.str.upper()
-
-                # Process active ingredients if exists
-                if data.get('active_ingredients'):
-                    active_ing_df = pd.DataFrame(data['active_ingredients'])
-                    active_ing_df['eparegno'] = data['eparegno']
-                    active_ing_df.columns = active_ing_df.columns.str.upper()
-
-                # Process sites if exists
-                if data.get('sites'):
-                    sites_df = pd.DataFrame(data['sites'])
-                    sites_df['eparegno'] = data['eparegno']
-                    sites_df.columns = sites_df.columns.str.upper()
-
-                # Process pests if exists
-                if data.get('pests'):
-                    pests_df = pd.DataFrame(data['pests'])
-                    pests_df['eparegno'] = data['eparegno']
-                    pests_df.columns = pests_df.columns.str.upper()
-
-                # Process formulations if exists
-                if data.get('formulations'):
-                    formulations_df = pd.DataFrame(data['formulations'])
-                    formulations_df['eparegno'] = data['eparegno']
-                    formulations_df.columns = formulations_df.columns.str.upper()
-
-                # Process alternative brand names if exists
-                if data.get('altbrandnames'):
-                    altbrands_df = pd.DataFrame(data['altbrandnames'])
-                    altbrands_df['eparegno'] = data['eparegno']
-                    altbrands_df.columns = altbrands_df.columns.str.upper()
-
-                # Process PDF files if exists
-                if data.get('pdffiles'):
-                    pdf_df = pd.DataFrame(data['pdffiles'])
-                    pdf_df['eparegno'] = data['eparegno']
-                    pdf_df['pdffile_accepted_date'] = pdf_df['pdffile_accepted_date']
-                    pdf_df.columns = pdf_df.columns.str.upper()
-
-                # Process types if exists
-                if data.get('types'):
-                    types_df = pd.DataFrame(data['types'])
-                    types_df['eparegno'] = data['eparegno']
-                    types_df.columns = types_df.columns.str.upper()
-
-                # Process transfer history if exists
-                if data.get('transfer_history'):
-                    transfer_df = pd.DataFrame(data['transfer_history'])
-                    transfer_df['eparegno'] = data['eparegno']
-                    if 'transfer_date' in transfer_df.columns:
-                        transfer_df['transfer_date'] = transfer_df['transfer_date']
-                    transfer_df.columns = transfer_df.columns.str.upper()
-
-                # Load data to Snowflake
-                conn = self.get_snowflake_connection()
-                
-                # Write each DataFrame if it exists
-                write_pandas(conn, product_df, 'EPA_PRODUCTS')
-                
-                if company_df is not None:
-                    write_pandas(conn, company_df, 'EPA_COMPANY_INFO')
-                if active_ing_df is not None:
-                    write_pandas(conn, active_ing_df, 'EPA_ACTIVE_INGREDIENTS')
-                if sites_df is not None:
-                    write_pandas(conn, sites_df, 'EPA_SITES')
-                if pests_df is not None:
-                    write_pandas(conn, pests_df, 'EPA_PESTS')
-                if types_df is not None:
-                    write_pandas(conn, types_df, 'EPA_TYPES')
-                if pdf_df is not None:
-                    write_pandas(conn, pdf_df, 'EPA_PDF_FILES')
-                if altbrands_df is not None:
-                    write_pandas(conn, altbrands_df, 'EPA_ALT_BRAND_NAMES')
-                if formulations_df is not None:
-                    write_pandas(conn, formulations_df, 'EPA_FORMULATIONS')
-                if transfer_df is not None:
-                    write_pandas(conn, transfer_df, 'EPA_TRANSFER_HISTORY')
-
+                for table, df_list in accumulated.items():
+                    combined = pd.concat(df_list, ignore_index=True)
+                    write_pandas(conn, combined, table)
+            finally:
                 conn.close()
-                logging.info(f"Successfully processed EPA number: {epa_number}")
-                
-                # Add delay between requests
-                time.sleep(5)
 
-            except Exception as e:
-                logging.error(f"Error processing EPA number {epa_number}: {str(e)}")
+        logging.info(
+            f"process_and_load_data summary: {len(succeeded)} succeeded, "
+            f"{len(failed)} failed out of {len(epa_numbers)} total"
+        )
+        if failed:
+            logging.warning(f"Failed EPA numbers: {failed}")
+        return {'succeeded': succeeded, 'failed': failed}
+
     def pdf_to_download(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+        cfg = self.db_config.config
 
         create_view = f"""
-            create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD(
+            create or replace view {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_DOWNLOAD']}(
             EPAREGNO,
             PRODUCTNAME,
             REGISTEREDDATE,
@@ -443,83 +476,101 @@ $$
             TRANSFER_FLAG,
             PDFFILE,
             PDFFILE_ACCEPTED_DATE
-        ) as 
+        ) as
         with updated as (
-        select prd.*, PDF.PDFFILE, PDF.PDFFILE_ACCEPTED_DATE
-        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PRODUCTS as prd
-        join {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_FILES as pdf on prd.eparegno = pdf.eparegno
-        qualify row_number() over (partition by PRD.eparegno order by pdffile_accepted_date desc) = 1
+            select prd.*, PDF.PDFFILE, PDF.PDFFILE_ACCEPTED_DATE
+            from {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PRODUCTS']} as prd
+            join {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_FILES']} as pdf
+              on prd.eparegno = pdf.eparegno
+            qualify row_number() over (
+                partition by PRD.eparegno
+                order by pdffile_accepted_date desc nulls last
+            ) = 1
         )
-        select UPDATED.*
-        from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA  AS M
-        RIGHT JOIN UPDATED ON UPDATED.PDFFILE = M.PDFFILE
-        WHERE M.PDFFILE IS NULL
+        select UPDATED.EPAREGNO,
+               UPDATED.PRODUCTNAME,
+               UPDATED.REGISTEREDDATE,
+               UPDATED.CANCEL_FLAG,
+               UPDATED.CANCELLATIONREASON,
+               UPDATED.PRODUCT_STATUS,
+               UPDATED.PRODUCT_STATUS_DATE,
+               UPDATED.SIGNAL_WORD,
+               UPDATED.RUP_YN,
+               UPDATED.TRANSFER_FLAG,
+               UPDATED.PDFFILE,
+               UPDATED.PDFFILE_ACCEPTED_DATE
+        from UPDATED
+        left join {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_META']} as M
+          on M.EPAREGNO = UPDATED.EPAREGNO
+        where M.EPAREGNO is null
+           or M.PDFFILE              is distinct from UPDATED.PDFFILE
+           or M.PDFFILE_ACCEPTED_DATE is distinct from UPDATED.PDFFILE_ACCEPTED_DATE
         """
 
         try:
             cursor = conn.cursor()
-            cursor.execute(create_view)
-            cursor.close()
-        except Exception as e:
-            print(f"Error creating view pdf_to_download: {str(e)}")
-            raise
+            try:
+                cursor.execute(create_view)
+            finally:
+                cursor.close()
 
-        query = f"""
-            SELECT *
-            FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_DOWNLOAD
-        """
-
-        try:
+            query = f"""
+                SELECT *
+                FROM {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_DOWNLOAD']}
+            """
             df = pd.read_sql(query, conn)
-            print(f"Retrieved {len(df)} records from Snowflake")
+            logging.info(f"Retrieved {len(df)} records from Snowflake")
             return df
         except Exception as e:
-            print(f"Error fetching data from Snowflake: {str(e)}")
+            logging.error(f"Error in pdf_to_download: {str(e)}")
             raise
+        finally:
+            conn.close()
 
     def pdf_to_chunk(self):
         """Fetch pdf files data to download from Snowflake using the specified query"""
         conn = self.get_snowflake_connection()
+        cfg = self.db_config.config
 
         create_view = f"""
-        create or replace view {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK(
+        create or replace view {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_CHUNK']}(
             RELATIVE_PATH,
             SIZE,
             LAST_MODIFIED,
             MD5,
             ETAG,
             FILE_URL
-        ) as 
+        ) as
         select store.*
-        from directory(@{self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.PDF_STORE) as store
+        from directory(@{cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['STAGE_NAME']}) as store
         inner join (
-            select *, REGEXP_SUBSTR(stage_file_path, 'EPA_LABEL_PDF/.*$') as META_relative_path
-            from {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.EPA_PDF_INGESTION_METADATA 
+            select *, REGEXP_SUBSTR(stage_file_path, '{cfg['STAGE_FOLDER']}/.*$') as META_relative_path
+            from {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_META']}
             where processing_status = 'PENDING'
-            ) as meta 
+            ) as meta
             on meta.META_relative_path = store.relative_path
         """
 
         try:
             cursor = conn.cursor()
-            cursor.execute(create_view)
-            cursor.close()
-        except Exception as e:
-            print(f"Error creating view pdf_to_chunk: {str(e)}")
-            raise
+            try:
+                cursor.execute(create_view)
+            finally:
+                cursor.close()
 
-        query = f"""
-            SELECT *
-            FROM {self.db_config.config['SRC_INGEST_DB']}.EPA_RAW.VW_PDF_TO_CHUNK
-        """
-
-        try:
+            query = f"""
+                SELECT *
+                FROM {cfg['SRC_INGEST_DB']}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_CHUNK']}
+            """
             df = pd.read_sql(query, conn)
-            print(f"Retrieved {len(df)} records from Snowflake")
+            logging.info(f"Retrieved {len(df)} records from Snowflake")
             return df
         except Exception as e:
-            print(f"Error fetching data from Snowflake: {str(e)}")
+            logging.error(f"Error in pdf_to_chunk: {str(e)}")
             raise
+        finally:
+            conn.close()
+
     def clean_filename(self, filename):
         """Clean filename to remove invalid characters and spaces"""
         # Remove invalid characters
@@ -543,27 +594,26 @@ $$
             cursor.execute(put_command)
             return True
         except Exception as e:
-            print(f"Error uploading to stage: {str(e)}")
+            logging.error(f"Error uploading to stage: {str(e)}")
             return False
         finally:
             cursor.close()
+            conn.close()
 
     def store_pdf_metadata_snowflake(self, metadata_records):
         """Store PDF metadata in Snowflake"""
         conn = self.get_snowflake_connection()
         cursor = conn.cursor()
+        cfg = self.db_config.config
+        src_ingest_db = cfg['SRC_INGEST_DB']
         metadata_df = pd.DataFrame(metadata_records)
         metadata_df.columns = metadata_df.columns.str.upper()
-        temp_table_name = 'TEMP_EPA_PDF_INGESTION_METADATA'
-        table_name = 'EPA_PDF_INGESTION_METADATA'
-        # Create table if it doesn't exist
-        cursor = conn.cursor()
+        temp_table_name = cfg['TBL_TEMP_PDF_META']
+        table_name = cfg['TBL_PDF_META']
+        orphans = []
         try:
-            # Write to temporary table
-
-                    # Metadata table
-            cursor.execute("""
-            CREATE TEMP TABLE IF NOT EXISTS TEMP_EPA_PDF_INGESTION_METADATA (
+            cursor.execute(f"""
+            CREATE TEMP TABLE IF NOT EXISTS {temp_table_name} (
                 id INTEGER AUTOINCREMENT,
                 product_name VARCHAR,
                 stage_file_path VARCHAR,
@@ -579,8 +629,20 @@ $$
             """)
 
             success = write_pandas(conn, metadata_df, temp_table_name)
-            
+
             if success:
+                # Capture old stage paths for EPAREGNOs whose STAGE_FILE_PATH is changing,
+                # so we can REMOVE the orphaned files from the stage after the MERGE commits.
+                cursor.execute(f"""
+                SELECT t.EPAREGNO,
+                       REGEXP_SUBSTR(t.STAGE_FILE_PATH, '{cfg['STAGE_FOLDER']}/.*$') AS OLD_REL_PATH
+                FROM {table_name} t
+                JOIN {temp_table_name} s ON t.EPAREGNO = s.EPAREGNO
+                WHERE t.STAGE_FILE_PATH IS DISTINCT FROM s.STAGE_FILE_PATH
+                  AND t.STAGE_FILE_PATH IS NOT NULL
+                """)
+                orphans = cursor.fetchall()
+
                 # Perform MERGE operation
                 merge_sql = f"""
                 MERGE INTO {table_name} t
@@ -624,109 +686,97 @@ $$
                 
                 # Clean up temporary table
                 cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-                
+
                 conn.commit()
                 success = True
+
+                # After metadata commit, remove any orphaned stage files whose paths changed.
+                # REMOVE on a missing path is a no-op; per-iteration try/except keeps a single
+                # failure from aborting the rest. Metadata is already the source of truth.
+                for epa, old_rel in orphans:
+                    if not old_rel:
+                        continue
+                    try:
+                        cursor.execute(
+                            f"REMOVE @{src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['STAGE_NAME']}/{old_rel}"
+                        )
+                        logging.info(f"Removed orphaned stage file for {epa}: {old_rel}")
+                    except Exception as e:
+                        logging.warning(f"Failed to REMOVE orphan {old_rel} for {epa}: {e}")
         except Exception as e:
-            print(f"Error writing to Snowflake: {str(e)}")
+            logging.error(f"Error writing to Snowflake: {str(e)}")
             conn.rollback()
             success = False
         finally:
             cursor.close()
-            
+            conn.close()
+
         return success
 
+    def _download_single_pdf(self, row, temp_dir: str, stage_path: str) -> Dict:
+        """Download one PDF and upload to Snowflake stage. Called in parallel."""
+        base_url = "https://www3.epa.gov/pesticides/chem_search/ppls/"
+        pdf_file = row['PDFFILE']
+        product_name = row['PRODUCTNAME']
+        epa_number = row['EPAREGNO']
+        url = f"{base_url}{pdf_file}"
+        filename = f"{self.clean_filename(f'{product_name}_{epa_number}')}.pdf"
+        temp_file_path = os.path.join(temp_dir, filename)
+
+        response = requests.get(url)
+        response.raise_for_status()
+
+        with open(temp_file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        if not self.upload_to_snowflake_stage(temp_file_path, stage_path, filename):
+            raise Exception("Failed to upload to Snowflake stage")
+
+        logging.info(f"Successfully uploaded: {filename}")
+        time.sleep(1)
+
+        return {
+            'metadata': {
+                'product_name': product_name,
+                'stage_file_path': f"{stage_path}/{filename}",
+                'original_url': url,
+                'file_size_bytes': len(response.content),
+                'upload_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'processing_status': 'PENDING',
+                'EPAREGNO': epa_number,
+                'PDF_FILE_NAME': filename,
+                'PDFFILE_ACCEPTED_DATE': row['PDFFILE_ACCEPTED_DATE'],
+                'PDFFILE': row['PDFFILE']
+            },
+            'success': {'product_name': product_name, 'stage_file_path': f"{stage_path}/{filename}"}
+        }
+
     def download_and_store_pdfs(self, df, stage_path):
-        """
-        Download PDFs and store them in a file system for Document AI processing
-        
-        Parameters:
-        df (pd.DataFrame): DataFrame containing 'PDFFILE' and 'PRODUCTNAME' columns
-        storage_path (str): Base path to store PDFs
-        snowflake_credentials (dict): Snowflake connection credentials
-        """
-        
-        # Connect to Snowflake
-        conn = self.get_snowflake_connection()
+        results = {'success': [], 'failed': []}
+        metadata_records = []
 
-
-        try:
-            # Fetch data from Snowflake
-        
-            base_url = "https://www3.epa.gov/pesticides/chem_search/ppls/"
-            results = {'success': [], 'failed': []}
-            metadata_records = []
-            
-            # Create temporary directory for intermediate storage
-            with tempfile.TemporaryDirectory() as temp_dir:
-                for index, row in df.iterrows():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(self._download_single_pdf, row, temp_dir, stage_path): row['PRODUCTNAME']
+                    for _, row in df.iterrows()
+                }
+                for future in as_completed(futures):
+                    product_name = futures[future]
                     try:
-                        pdf_file = row['PDFFILE']
-                        product_name = row['PRODUCTNAME']
-                        epa_number = row['EPAREGNO']
-                        url = f"{base_url}{pdf_file}"
-                        unclean_filename = f"{product_name}_{epa_number}"
-                        
-                        # Create clean filename
-                        clean_name = self.clean_filename(unclean_filename)
-                        filename = f"{clean_name}.pdf"
-                        temp_file_path = os.path.join(temp_dir, filename)
-                        
-                        # Download PDF
-                        response = requests.get(url)
-                        response.raise_for_status()
-                        
-                        # Save to temporary file
-                        with open(temp_file_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        
-                        # Upload to Snowflake stage
-                        if self.upload_to_snowflake_stage(temp_file_path, stage_path, filename):
-                            # Prepare metadata
-                            metadata_records.append({
-                                'product_name': product_name,
-                                'stage_file_path': f"{stage_path}/{filename}",
-                                'original_url': url,
-                                'file_size_bytes': len(response.content),
-                                'upload_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'processing_status': 'PENDING',
-                                'EPAREGNO': epa_number,
-                                'PDF_FILE_NAME': filename,
-                                'PDFFILE_ACCEPTED_DATE': row['PDFFILE_ACCEPTED_DATE'],
-                                'PDFFILE': row['PDFFILE']
-                            })
-                            
-                            results['success'].append({
-                                'product_name': product_name,
-                                'stage_file_path': f"{stage_path}/{filename}"
-                            })
-                            
-                            print(f"Successfully uploaded: {filename}")
-                        else:
-                            raise Exception("Failed to upload to Snowflake stage")
-                        
-                        # Add delay to be respectful to the server
-                        time.sleep(1)
-                        
+                        result = future.result()
+                        metadata_records.append(result['metadata'])
+                        results['success'].append(result['success'])
                     except Exception as e:
-                        print(f"Error processing {product_name}: {str(e)}")
-                        results['failed'].append({
-                            'product_name': product_name,
-                            'error': str(e)
-                        })
-                
-                # Store metadata in Snowflake
-                if metadata_records:
-                    store_success = self.store_pdf_metadata_snowflake(metadata_records)
+                        logging.error(f"Error processing {product_name}: {str(e)}")
+                        results['failed'].append({'product_name': product_name, 'error': str(e)})
 
-                    if not store_success:
-                        print("Warning: Failed to store metadata in Snowflake")
-            
-        finally:
-            conn.close()
-        
+            if metadata_records:
+                if not self.store_pdf_metadata_snowflake(metadata_records):
+                    logging.warning("Failed to store metadata in Snowflake")
+
         return results
     
     def process_pdf_chunks(self):
@@ -738,38 +788,48 @@ $$
         """
         conn = self.get_snowflake_connection()
         cursor = conn.cursor()
-        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
-        
+        cfg = self.db_config.config
+        src_ingest_db = cfg['SRC_INGEST_DB']
+
         try:
+            # Delete chunks for every EPAREGNO about to be re-chunked, regardless of the
+            # old RELATIVE_PATH. Filename convention is {PRODUCTNAME}_{EPAREGNO}.pdf, so any
+            # chunk whose path ends with _<EPAREGNO>.pdf belongs to that product. This catches
+            # orphaned chunks left behind when a PDF was previously chunked under a different
+            # filename. ESCAPE neutralizes SQL's '_' wildcard.
             delete_query = f"""
-            DELETE FROM {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE AS T1
-            USING {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK AS T2
-            WHERE T1.RELATIVE_PATH = T2.RELATIVE_PATH
+            DELETE FROM {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']} T1
+            USING (
+                SELECT DISTINCT M.EPAREGNO
+                FROM {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_META']} M
+                JOIN {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_CHUNK']} V
+                  ON REGEXP_SUBSTR(M.STAGE_FILE_PATH, '{cfg['STAGE_FOLDER']}/.*$') = V.RELATIVE_PATH
+            ) TGT
+            WHERE T1.RELATIVE_PATH ILIKE '%\\\\_' || TGT.EPAREGNO || '.pdf' ESCAPE '\\\\'
             """
             cursor.execute(delete_query)
-            
+
             insert_query = f"""
-            INSERT INTO {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE (relative_path, size, file_url, scoped_file_url, chunk)
+            INSERT INTO {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']} (relative_path, size, file_url, scoped_file_url, chunk)
             WITH pdf_to_chunk AS (
-                SELECT 
-                    new_docs.relative_path, 
-                    new_docs.size, 
-                    new_docs.file_url, 
-                    build_scoped_file_url(@{src_ingest_db}.EPA_RAW.PDF_STORE, new_docs.relative_path) AS scoped_file_url
-                FROM {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK as new_docs
+                SELECT
+                    new_docs.relative_path,
+                    new_docs.size,
+                    new_docs.file_url,
+                    build_scoped_file_url(@{src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['STAGE_NAME']}, new_docs.relative_path) AS scoped_file_url
+                FROM {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_CHUNK']} as new_docs
             )
             SELECT *
             FROM pdf_to_chunk,
-            TABLE({src_ingest_db}.EPA_PROCESSED.TEXT_CHUNKER(TO_VARCHAR(SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@{src_ingest_db}.EPA_RAW.PDF_STORE, 
+            TABLE({src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['UDF_TEXT_CHUNKER'].upper()}(TO_VARCHAR(SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@{src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['STAGE_NAME']},
                                         relative_path, {{'mode': 'LAYOUT'}}))))
             """
             cursor.execute(insert_query)
-            
 
             update_query = f"""
-            UPDATE EPA_PDF_INGESTION_METADATA m
+            UPDATE {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_META']} m
             SET PROCESSING_STATUS = 'CHUNKED'
-            FROM {src_ingest_db}.EPA_RAW.VW_PDF_TO_CHUNK c
+            FROM {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['VW_PDF_CHUNK']} c
             WHERE m.STAGE_FILE_PATH LIKE '%' || c.RELATIVE_PATH
             """
             cursor.execute(update_query)
@@ -791,11 +851,11 @@ $$
     def update_category(self):
         conn = self.get_snowflake_connection()
         cursor = conn.cursor()
-        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+        cfg = self.db_config.config
+        src_ingest_db = cfg['SRC_INGEST_DB']
         try:
-            
             alter_table = f"""
-                ALTER TABLE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+                ALTER TABLE {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']}
                 ADD COLUMN
                     IF NOT EXISTS COMPANYNAME VARCHAR,
                     IF NOT EXISTS PRODUCTNAME VARCHAR,
@@ -805,23 +865,23 @@ $$
             cursor.execute(alter_table)
 
             update_query = f"""
-            UPDATE {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE A
-                SET 
+            UPDATE {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']} A
+                SET
                 A.COMPANYNAME = C.NAME,
                 A.PRODUCTNAME = B.PRODUCT_NAME,
                 A.SIGNAL_WORD = D.SIGNAL_WORD,
                 A.CATEGORY_EPA_TYPE = TYPE_ARRAY
-                FROM {src_ingest_db}.EPA_RAW.EPA_PDF_INGESTION_METADATA B 
-                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_COMPANY_INFO AS C ON B.EPAREGNO =C.EPAREGNO
-                LEFT JOIN {src_ingest_db}.EPA_RAW.EPA_PRODUCTS AS D ON D.EPAREGNO = B.EPAREGNO
+                FROM {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PDF_META']} B
+                LEFT JOIN {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_COMPANY_INFO']} AS C ON B.EPAREGNO =C.EPAREGNO
+                LEFT JOIN {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_PRODUCTS']} AS D ON D.EPAREGNO = B.EPAREGNO
                 LEFT JOIN (
-                    SELECT 
+                    SELECT
                         EPAREGNO,
                         ARRAY_AGG(TYPE) AS TYPE_ARRAY
-                    FROM {src_ingest_db}.EPA_RAW.EPA_TYPES
+                    FROM {src_ingest_db}.{cfg['RAW_SCHEMA']}.{cfg['TBL_TYPES']}
                     GROUP BY EPAREGNO
                 ) T ON T.EPAREGNO = B.EPAREGNO
-                WHERE A.RELATIVE_PATH = REGEXP_SUBSTR(B.stage_file_path, 'EPA_LABEL_PDF/.*$')
+                WHERE A.RELATIVE_PATH = REGEXP_SUBSTR(B.stage_file_path, '{cfg['STAGE_FOLDER']}/.*$')
             """
             cursor.execute(update_query)
             conn.commit()
@@ -838,18 +898,19 @@ $$
     def create_cortex_search_(self):
         conn = self.get_snowflake_connection()
         cursor = conn.cursor()
-        src_ingest_db = self.db_config.config['SRC_INGEST_DB']
+        cfg = self.db_config.config
+        src_ingest_db = cfg['SRC_INGEST_DB']
 
         try:
             query = f"""
-            create or replace CORTEX SEARCH SERVICE {src_ingest_db}.EPA_PROCESSED.CC_SEARCH_SERVICE_CS_{src_ingest_db}
+            create or replace CORTEX SEARCH SERVICE {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['CORTEX_SVC_PREFIX']}_{src_ingest_db}
             ON chunk
             ATTRIBUTES PRODUCTNAME, SIGNAL_WORD, CATEGORY_EPA_TYPE, COMPANYNAME
-            warehouse = COMPUTE_WH
+            warehouse = {cfg['WAREHOUSE']}
             TARGET_LAG = '1 minute'
             as (
                 select *
-                from {src_ingest_db}.EPA_PROCESSED.DOCS_CHUNKS_TABLE
+                from {src_ingest_db}.{cfg['PROC_SCHEMA']}.{cfg['TBL_DOCS_CHUNKS']}
             )
             """
             cursor.execute(query)
@@ -866,6 +927,13 @@ $$
 
 # Usage example
 if __name__ == "__main__":
+    # Load config.yaml if present (falls back to built-in defaults when absent)
+    config_path = Path(__file__).parent / 'config.yaml'
+    yaml_cfg = {}
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+
     # Environment variable
     env = os.getenv('ENVIRONMENT', 'DEV')
 
@@ -874,11 +942,11 @@ if __name__ == "__main__":
         'user': os.getenv('user'),
         'password': os.getenv('password'),
         'account': os.getenv('account'),
-        'warehouse': 'COMPUTE_WH'
+        'warehouse': yaml_cfg.get('snowflake', {}).get('warehouse', 'COMPUTE_WH')
     }
 
     # Initialize processor and create tables
-    processor = EPADataProcessor(snowflake_params, env)
+    processor = EPADataProcessor(snowflake_params, env, yaml_cfg)
 
     
     epa_df = processor.get_focus_products()
